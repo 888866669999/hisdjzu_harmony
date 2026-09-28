@@ -21,7 +21,6 @@ import { LoginPage } from './LoginPage';
 import { SchedulePage } from './SchedulePage';
 import { ScorePage } from './ScorePage';
 import { PlanPage } from './PlanPage';
-import { ElectivePage } from './ElectivePage';
 import { ClassroomPage } from './ClassroomPage';
 import { ProfilePage } from './ProfilePage';
 import { SettingsPage } from './SettingsPage';
@@ -117,11 +116,10 @@ struct Index {
   // 原先用 emoji：无法着色、跟不了主题与选中态，不同设备字形也不一致。
   //
   // 导航项与 Flutter 端 `kNavItems` 逐项对齐（课表/成绩/培养/我的）。
-  // 两项刻意不在其中：
-  //   · 「空教室」挂在课表页顶栏 —— 看课表时最常接着问的就是「哪儿有空教室」，
-  //     放在 dock 既多占一格，又与「查自己的教务数据」这几个主入口不同类；
-  //   · 「通选」（修读情况）改从培养页进入 —— 它与「培养」是同一件事的两个视角，
-  //     页面与路由都保留（见 content() 的 'elective' 分支），只是不占导航格。
+  //
+  // 「空教室」刻意不在其中：它挂在课表页顶栏 —— 看课表时最常接着问的
+  // 就是「哪儿有空教室」，放在 dock 既多占一格，
+  // 又与「查自己的教务数据」这几个主入口不同类。
   private navItems: NavItem[] = [
     new NavItem('schedule', '课表', 'calendar_month'),
     new NavItem('score', '成绩', 'bar_chart'),
@@ -335,8 +333,6 @@ struct Index {
       ScorePage()
     } else if (this.active === 'plan') {
       PlanPage()
-    } else if (this.active === 'elective') {
-      ElectivePage()
     } else if (this.active === 'classroom') {
       ClassroomPage()
     } else if (this.active === 'profile') {

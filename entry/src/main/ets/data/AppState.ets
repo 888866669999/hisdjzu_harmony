@@ -8,7 +8,6 @@ import { CookieJar } from '../network/CookieJar';
 import { PrefStore } from '../data/PrefStore';
 import { CredentialStore } from '../data/CredentialStore';
 import { ClassNotifier } from '../data/ClassNotifier';
-import { ElectiveRequirementStore } from '../data/ElectiveRequirementStore';
 import { PageCache } from '../data/PageCache';
 import { Timetable, ScoreRecord, StudentProfile } from '../model/Models';
 import { Logger } from '../common/Logger';
@@ -49,7 +48,7 @@ export class AppState {
   /**
    * 已加载数据缓存。
    *
-   * **只缓存课表**。其余（成绩 / 个人信息 / 培养方案 / 通选课 / 周历）
+   * **只缓存课表**。其余（成绩 / 个人信息 / 培养方案 / 周历）
    * 一律不做会话级缓存，每次进入页面都向服务器重新取，以保证时效性 ——
    * 成绩刚出、培养方案被调整这类变化必须能立刻看到，
    * 而这几个页面本身访问频率很低，重复请求的代价可以接受。
@@ -115,7 +114,7 @@ export class AppState {
    * 会话失效的后果因此被推迟到「真正需要联网的那一刻」：
    * 由 QzApi.ensureAuthed 置「等待重新验证」标记，界面弹出居中的重新登录弹窗。
    *
-   * 这样「只看课表」永远是安静的；一旦点到成绩/培养/通选/空教室等需要请求的功能，
+   * 这样「只看课表」永远是安静的；一旦点到成绩/培养/空教室等需要请求的功能，
    * 才会看到弹窗（有凭据只需补验证码，无凭据给完整登录表单）。
    */
   static async verifySessionInBackground(): Promise<void> {
@@ -247,8 +246,7 @@ export class AppState {
    *     - 已保存账号 → 课表缓存按账号分片，留着会让下一次读到 A 的课表
    *     - 上次学期/周次/成绩学期 → 会把 B 引导到 A 的学期
    *     - 等待重新验证标记 → 否则 B 登录瞬间弹出 A 遗留的验证码弹窗
-   *     - 通选课要求学分 → 按专业录的，留着会以 A 的要求判断 B 的达标
-   *
+     *
    * 刻意**不删**课表文件与系统日历日程：
    *   课表按「账号+学期」分文件保存，换回原账号要能读回本地修改；
    *   系统日历日程是用户主动开启、由系统托管的，退出登录通常只是临时的。
@@ -272,9 +270,7 @@ export class AppState {
     //    之后 resolveAccount() 就再也问不出「要清哪个账号的数据」了。
     const account: string = await AppState.resolveAccount();
     try {
-      // 通选课要求学分按账号分片：留着会让下一个账号以本账号的要求判断达标
-      await ElectiveRequirementStore.clearAccount(account);
-      // 页面缓存（成绩/培养方案/通选/个人信息/空教室/校历原文）。
+      // 页面缓存（成绩/培养方案/个人信息/空教室/校历原文）。
       // **必须清**：缓存内容是上一个账号的数据。磁盘层按账号前缀分文件，
       // 不清就长期留在设备上；内存层更直接 —— 同一次进程内换个账号登录，
       // 旧条目仍在内存里。必须在下面 PrefStore.clearAccount() 清掉账号之前调用，

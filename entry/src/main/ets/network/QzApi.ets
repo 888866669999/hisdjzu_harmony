@@ -15,16 +15,15 @@ import { ScoreParser } from '../parser/ScoreParser';
 import { ProfileParser } from '../parser/ProfileParser';
 import { WeekCalendarParser } from '../parser/WeekCalendarParser';
 import { PlanParser } from '../parser/PlanParser';
-import { ElectiveParser } from '../parser/ElectiveParser';
 import { ClassroomParser } from '../parser/ClassroomParser';
 import { Timetable, ScoreRecord, StudentProfile, WeekDate, ChoiceItem,
-  PlanDetail, ElectiveReport, ElectiveCourse } from '../model/Models';
+  PlanDetail } from '../model/Models';
 import { ClassroomResult } from '../model/ClassroomModels';
 import { PrefStore } from '../data/PrefStore';
 import {
   BASE_ORIGIN, PATH_LOGIN_PAGE, PATH_CAPTCHA, PATH_LOGON, PATH_MAIN,
   PATH_TIMETABLE, PATH_SCORE_LIST, PATH_SCORE_QUERY, PATH_PROFILE,
-  PATH_WEEK_CALENDAR, PATH_PLAN_DETAIL, PATH_ELECTIVE, PATH_ELECTIVE_DETAIL,
+  PATH_WEEK_CALENDAR, PATH_PLAN_DETAIL,
   PATH_CLASSROOM, PATH_CLASSROOM_QUERY, PATH_CLASSROOM_AJAX, DEFAULT_SECTION_MODE_ID,
   AS_LOGGED_IN, AS_HAS_CREDENTIAL
 } from '../common/Constants';
@@ -449,37 +448,6 @@ export class QzApi {
     const res: HttpResponse = await this.client.get(BASE_ORIGIN + PATH_PLAN_DETAIL);
     this.checkResponse(res);
     return res.body;
-  }
-
-  /** 通选课修读情况 */
-  async getElectiveReport(): Promise<ElectiveReport> {
-    return ElectiveParser.parse(await this.getElectiveHtml());
-  }
-
-  /** 通选课页原文 */
-  async getElectiveHtml(): Promise<string> {
-    const res: HttpResponse = await this.client.get(BASE_ORIGIN + PATH_ELECTIVE);
-    this.checkResponse(res);
-    return res.body;
-  }
-
-  /**
-   * 某大类下的课程明细（详情页原文）。
-   *
-   * 大类名来自主页解析结果，属**服务端数据**（不是用户输入），
-   * 但仍按查询参数编码，避免名字里的特殊字符破坏 URL。
-   */
-  async getElectiveCoursesHtml(categoryName: string): Promise<string> {
-    const url: string = BASE_ORIGIN + PATH_ELECTIVE_DETAIL +
-      '?kctxmc=' + encodeURIComponent(categoryName);
-    const res: HttpResponse = await this.client.get(url);
-    this.checkResponse(res);
-    return res.body;
-  }
-
-  /** 某大类下的课程明细 */
-  async getElectiveCourses(categoryName: string): Promise<ElectiveCourse[]> {
-    return ElectiveParser.parseDetail(await this.getElectiveCoursesHtml(categoryName));
   }
 
   // ==================== 空教室查询 ====================

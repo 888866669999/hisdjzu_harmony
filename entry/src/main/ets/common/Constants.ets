@@ -60,27 +60,6 @@ export const PATH_PROFILE: string = '/jsxsd/bygl/bysxx';
 export const PATH_WEEK_CALENDAR: string = '/jsxsd/jxzl/jxzl_query';
 /** 培养方案明细（含培养方案 PDF 附件） */
 export const PATH_PLAN_DETAIL: string = '/jsxsd/pyfa/topyfamx';
-/** 通选课修读情况（山建叫「学习完成情况查看」） */
-export const PATH_ELECTIVE: string = '/jsxsd/xxwcqk/xxwcqkOnkctxBy.do';
-
-/**
- * 通选大类**详情**页 —— 课程明细的来源（GET 参数 `kctxmc=<大类名>`）。
- *
- * 通选主页是单表，只有各专业的学分统计；每行的「详情」是页面里
- * `window.open('/jsxsd/xxwcqk/xxwcqkOnkctxByxq.do?kctxmc=…')`。
- * 该地址可直接 GET（实测会话与 Referer 都无特殊要求），
- * 返回 8 列的课程表 —— 大类标题的下拉展开就靠它。
- */
-export const PATH_ELECTIVE_DETAIL: string = '/jsxsd/xxwcqk/xxwcqkOnkctxByxq.do';
-
-/**
- * 用户自录的「通选课各大类要求学分」。
- *
- * 学校页面的「要求学分（大于等于）」一列是空的，用户可按培养方案自行录入，
- * 见 ElectiveRequirementStore。按账号分片存储。
- */
-export const KEY_ELECTIVE_REQUIRED: string = 'elective_required';
-
 /** 空闲教室：筛选器页面（校区/学期下拉的来源） */
 export const PATH_CLASSROOM: string = '/jsxsd/kbxx/jsjy_query';
 /** 空闲教室查询结果（POST，参数见 QzApi.queryClassroom） */
@@ -363,7 +342,6 @@ export const AS_WINDOW_HEIGHT: string = 'windowHeight';
 export const CACHE_SCORE_LIST: string = 'score_list';
 export const CACHE_SCORE_SEMESTERS: string = 'score_semesters';
 export const CACHE_PLAN: string = 'plan';
-export const CACHE_ELECTIVE: string = 'elective';
 export const CACHE_PROFILE: string = 'profile';
 export const CACHE_CLASSROOM_OPTIONS: string = 'classroom_options';
 export const CACHE_CLASSROOM_BUILDINGS: string = 'classroom_buildings';
@@ -385,7 +363,6 @@ export const CACHE_SEMESTER_LIST: string = 'semester_list';
  */
 export const TTL_SCORE_LIST: number = 2 * 60 * 1000;
 export const TTL_SCORE_SEMESTERS: number = 6 * 60 * 60 * 1000;
-export const TTL_ELECTIVE: number = 10 * 60 * 1000;
 export const TTL_PLAN: number = 6 * 60 * 60 * 1000;
 export const TTL_PROFILE: number = 6 * 60 * 60 * 1000;
 export const TTL_CLASSROOM_OPTIONS: number = 6 * 60 * 60 * 1000;
