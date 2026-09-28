@@ -138,6 +138,50 @@ export const SECTIONS: SectionDef[] = [
 ];
 
 /**
+ * 课表表头（星期 + 日期）高度（vp）。
+ *
+ * 固定值、不参与均分：表头只有两行短文本，高度是已知量。抽成常量是因为
+ * 它有**两个必须一致的用处** —— 渲染时的 height，以及 [fitRowHeight] 里
+ * 「可用高度先减掉表头」这一步。两边各写各的字面量时，改一处漏一处就会
+ * 让整周差出一整行的高度。
+ */
+export const GRID_HEADER_H: number = 46;
+
+/** 单行课的最小高度（vp）：屏幕再矮也不压到这个值以下，否则文字无法阅读 */
+export const GRID_MIN_ROW_H: number = 20;
+
+/**
+ * 单行课的最大高度（vp）：屏幕再高也不让一行占掉半屏。
+ *
+ * 上限只在**极端高窗口**（如自由窗口拉到很高）时生效，那时整周不铺满、
+ * 底部留白 —— 这是有意的：把每一行都拉到 400vp 只会让课表显得松散。
+ */
+export const GRID_MAX_ROW_H: number = 420;
+
+/**
+ * 把「网格实测可用高度」等分成行高 —— 「任何屏幕比例都一页装下整周」的
+ * 数学保证就在这里。
+ *
+ * ===== 为什么要做成纯函数（而不是留在页面里）=====
+ * 这是整个适配里唯一**可以被证明**的部分：只要
+ * `表头 + 行数 × 行高 ≤ 实测高度`，整周就装得下，不存在「某种比例下
+ * 溢出」的可能。把它抽出来是为了让测试能直接对这条不变式断言
+ * （见 testdata/run-tests.mjs），而不是靠改完去设备上一屏屏试。
+ *
+ * 早先的做法是「按窗口高度乘一个比例估行高」，那是在猜可用高度 ——
+ * 可用高度由顶栏 + 筛选栏 + 备注 + dock 让位 + 安全区共同决定，
+ * 其中好几项随窗口比例变，没有任何系数能对所有比例都对。
+ */
+export function fitRowHeight(availH: number): number {
+  const rows: number = SECTIONS.length;
+  const each: number = (availH - GRID_HEADER_H) / rows;
+  if (isNaN(each) || each < GRID_MIN_ROW_H) {
+    return GRID_MIN_ROW_H;
+  }
+  return each > GRID_MAX_ROW_H ? GRID_MAX_ROW_H : each;
+}
+
+/**
  * 节次名的**统一显示写法**：`第一大节` → `第一节`。
  *
  * ===== 为什么需要它（同一个概念在三处三种叫法）=====

@@ -294,15 +294,19 @@ export struct CourseEditor {
 
       Scroll() {
         Column({ space: Theme.GAP }) {
-          this.field('课程名称', this.current().courseName, 'name', '如 数据结构')
-          this.field('教师', this.current().teacher, 'teacher', '如 张老师')
+          // 示例文字用「课程1 / 教师1 / 教室1 / 校区1」这种**无意义占位**：
+          // 早先填的是「数据结构 / 张老师 / 9-316 / 章丘」这类具体值 ——
+          // 它们看着像真的，用户会以为「是不是该照着填」，而其中还夹着
+          // 本校真实的楼名与校区名，换个学校就是错的。
+          this.field('课程名称', this.current().courseName, 'name', '如 课程1')
+          this.field('教师', this.current().teacher, 'teacher', '如 教师1')
           Row({ space: Theme.GAP_S }) {
             Column({ space: 6 }) {
               Text('教室')
                 .fontSize(Theme.FS_SMALL)
                 .fontColor($r('app.color.text_secondary'))
                 .width('100%')
-              TextInput({ placeholder: '如 9-316', text: this.current().room })
+              TextInput({ placeholder: '如 教室1', text: this.current().room })
                 .height(44)
                 .fontSize(Theme.FS_BODY)
                 .backgroundColor($r('app.color.surface_variant'))
@@ -319,7 +323,7 @@ export struct CourseEditor {
                 .fontSize(Theme.FS_SMALL)
                 .fontColor($r('app.color.text_secondary'))
                 .width('100%')
-              TextInput({ placeholder: '章丘', text: this.current().campus })
+              TextInput({ placeholder: '如 校区1', text: this.current().campus })
                 .height(44)
                 .fontSize(Theme.FS_BODY)
                 .backgroundColor($r('app.color.surface_variant'))

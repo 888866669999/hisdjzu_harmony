@@ -27,7 +27,8 @@ import { ReAuthService } from '../data/ReAuthService';
 import { Logger } from '../common/Logger';
 import { TextMeasure, TextMetrics } from '../common/TextMeasure';
 import { Theme } from '../theme/Theme';
-import { shortSectionLabel, SECTIONS, WEEKDAY_LABELS, SectionDef, KEY_LAST_WEEK, AS_WINDOW_WIDTH } from '../common/Constants';
+import { shortSectionLabel, SECTIONS, WEEKDAY_LABELS, SectionDef, KEY_LAST_WEEK, AS_WINDOW_WIDTH,
+  GRID_HEADER_H, fitRowHeight } from '../common/Constants';
 import { WeekCalendarParser } from '../parser/WeekCalendarParser';
 import { TimetableParser } from '../parser/TimetableParser';
 import { CampusCalendarService } from '../data/CampusCalendarService';
@@ -104,6 +105,26 @@ export struct SchedulePage {
   @State semesterPickerOpen: boolean = false;
   /** 校历弹窗 */
   @State calendarOpen: boolean = false;
+  /**
+   * 课表网格**实测可用高度**（vp），由网格容器的 onAreaChange 写入。
+   *
+   * ===== 为什么行高必须是「量出来的」而不是「猜出来的」=====
+   * 用户要求：任何屏幕比例下，整周课表都要一页显示完、不出现纵向滚动。
+   * 「一屏能不能装下」取决于可用高度，而可用高度是**布局算出来的**：
+   * 窗口高度减去顶栏、筛选栏、底部备注、dock 让位、系统安全区……
+   * 这些量有的随断点变（顶栏高度、dock）、有的随窗口比例变（安全区、
+   * 备注行数），没有任何一处代码能一次算准。早先按「窗口高度 × 比例」
+   * 估行高，结果就是：估小了底部溢出，估大了底部留白，
+   * 而且每换一种屏幕比例都要重新调一次系数。
+   *
+   * 现在改成量：网格容器用 .layoutWeight(1) 吃掉「备注之上的全部剩余
+   * 高度」，再用 onAreaChange 把这个高度读回来，5 行等分它。
+   * 数学上恒有 `表头 + 5 × 行高 = 实测高度`，因此**与屏幕比例无关**。
+   *
+   * 为 0 表示还没量到（首帧），此时 [rowHeight] 退回内容估算，
+   * 量到之后立即切到均分 —— 不会出现「首帧抖动」。
+   */
+  @State private gridAvailH: number = 0;
   // 校历弹窗的学期由 CalendarSheet 自己按 semester 代码处理
   // （它内部走教学周历 + 学期下拉），页面不再需要预推断学期号。
 
@@ -125,7 +146,9 @@ export struct SchedulePage {
   private budgetScope: CourseEntry[] = [];
 
   private static readonly WEEK_COUNT: number = 7;
-  private static readonly SECTION_COUNT: number = 5;
+  // 节次行数不再在这里写死：行高由 [fitRowHeight] 按 SECTIONS.length 均分，
+  // 两处各写一个「5」正是「改一处漏一处」的来源（作息在设置页可改，
+  // 万一以后节次数变了，写死的行数会算错行高）。
   /** 窄屏节次列宽 */
   /**
    * 窄屏节次列宽度（vp）。
@@ -411,10 +434,11 @@ export struct SchedulePage {
   /**
    * 卡片在「不限高」时想要的高度（vp）。
    *
-   * 用于算行高：先问每张卡「完整显示要多少」，取该节次里最高的一格作为行高；
-   * 行高定了之后再回过头按实际高度重新分配行数（见 [cardBudget]）。
-   * 这样既不会像旧实现那样把行高封顶（导致富余空白），
-   * 也不会让卡片无限长高（那会把整周挤出一屏）。
+   * ===== 现在只服务于首帧 =====
+   * 行高已由「实测可用高度 5 等分」决定（见 [rowHeight]），内容反过来适应
+   * 行高（见 [cardBudget]）。本方法只在 onAreaChange 报回实测高度**之前**
+   * 那一帧用一次，避免整周以 0 高度渲染再跳变 —— 因此它不求准，
+   * 只求「别差太远」。日常渲染路径不再经过这里。
    */
   private naturalCardHeight(e: CourseEntry, maxHeightVp: number): number {
     const scale: number = this.cardScale();
@@ -909,10 +933,9 @@ export struct SchedulePage {
   }
 
   /**
-   * 卡片高度：按「完整显示」估算（用于算行高）。
+   * 卡片高度：按「完整显示」估算 —— **仅首帧兜底用**（见 [rowHeight]）。
    *
-   * 与旧实现的根本差别：不再用 `chars = usable / (11*1.05)` 猜字宽，
-   * 也不算「教室最多 2 行」这种与高度无关的封顶 —— 全部走真实测量。
+   * 与旧实现相同的原则：不猜字宽、不按列宽封顶行数，全部走真实测量。
    *
    * [maxHeightVp] 给一个很宽的上限即可：本方法只关心「完整显示要多少」，
    * 实际能显示多少由 [cardBudget] 按格子高度再截一次。
@@ -924,7 +947,7 @@ export struct SchedulePage {
   /**
    * 探针高度：量「完整显示」时允许的最大高度。
    *
-   * 取一个「肯定够」的值（一屏高度），这样 [cardBudget] 不会因为探针太小
+   * 取一个「肯定够」的值（半个屏宽），这样 [cardBudget] 不会因为探针太小
    * 而提前截断行数 —— 我们要的是「完整需要多少」，不是「能塞多少」。
    */
   private cardMaxProbeHeight(): number {
@@ -932,8 +955,62 @@ export struct SchedulePage {
     return h * 0.5;
   }
 
-  /** 某节次行的高度 */
+  /**
+   * 节次行的 ForEach key —— **必须带上行高**。
+   *
+   * ===== 为什么（真机实测的坑）=====
+   * ForEach 按 key 复用节点：key 不变，那一项就整棵子树原样留着。
+   * 而这里的行高有两个来源：首帧的**内容估算**（onAreaChange 还没回报），
+   * 以及量到之后的**实测均分**。若 key 只写 `'nr' + sec.label`，
+   * 首帧渲染时 key 就已固定；等 onAreaChange 报回真实高度、rowHeight
+   * 变了，ArkUI 认为「这 5 项没变」，一行都不重建 ——
+   * 结果整周永远停在估算高度上。
+   *
+   * 平板（2560×1600，density 360）上实测到的现象：每行卡在估算下限
+   * 181vp，5 行要 951vp，而网格只有约 660vp，于是**只看得到前两节**，
+   * 后三节被推到可视区之外（用户报的「一页装不下整周」）。
+   *
+   * 把行高折进 key：高度一变 key 就变，5 行随之按新高度重建，整周铺满。
+   * 这与 [arkts-builder-not-reactive] / ForEach key 那条经验是同一个坑。
+   */
+  private rowKey(sec: SectionDef, rowIdx: number): string {
+    return 'r' + rowIdx.toString() + sec.label + '@' + Math.round(this.rowHeight(rowIdx));
+  }
+
+  /**
+   * 某节次行的高度（vp）。
+   *
+   * ===== 唯一判据：均分实测可用高度（用户要求「任何屏幕比例一页装下」）=====
+   * 表头固定，剩下 5 行严格等分 —— 于是「表头 + 5 行」恒等于网格容器的
+   * 实测高度，整周必然恰好铺满、既不溢出也不留白。数学在 [fitRowHeight]
+   * 里，且由测试对这条不变式直接断言。
+   *
+   * 行高不再由课程内容决定。这是与旧实现的根本差别，也是这条要求能
+   * 成立的前提：只要有一行是「内容说了算」，那天课多的时候整周就会被
+   * 撑出屏幕（旧实现正是如此 —— 自然高度累加，再把下限跟随列宽缩放，
+   * 靠一堆系数去逼近可用高度，屏幕比例一变就失准）。
+   *
+   * 内容反过来适应行高：格子矮了由 [cardBudget] 逐级降级
+   * （先保教室完整 → 再给课名 → 教师/单双周最后），不是让格子长大。
+   *
+   * [row] 只在首帧兜底时用得上（见下）。
+   */
   private rowHeight(row: number): number {
+    if (this.gridAvailH > 0) {
+      return fitRowHeight(this.gridAvailH);
+    }
+    // 首帧（还没量到可用高度）：退回内容估算，量到后立即切均分。
+    return this.estimatedRowHeight(row);
+  }
+
+  /**
+   * 按内容估算的行高 —— **仅用于首帧兜底**。
+   *
+   * 保留它的理由：onAreaChange 在首帧布局之后才回调，此时必须有一个
+   * 高度可画，否则整周会以 0 高度渲染一帧再跳变。用它估出来的值与
+   * 真实可用高度通常差不太多，肉眼看不到跳动。
+   */
+  private estimatedRowHeight(row: number): number {
     let max: number = 0;
     for (let c = 0; c < SchedulePage.WEEK_COUNT; c++) {
       const list: CourseEntry[] = this.visibleEntries(row, c);
@@ -1095,7 +1172,7 @@ export struct SchedulePage {
         .fill(this.showingCurrentWeek() && colIdx === this.todayCol()
           ? $r('app.color.brand') : Color.Transparent)
     }
-    .height(46)
+    .height(GRID_HEADER_H)
     .justifyContent(FlexAlign.Center)
     .width(narrow ? this.realColWidth() : undefined)
     .layoutWeight(narrow ? 0 : 1)
@@ -1286,7 +1363,7 @@ export struct SchedulePage {
         }
         .width('100%')
         .alignItems(VerticalAlign.Top)
-      }, (sec: SectionDef) => sec.label)
+      }, (sec: SectionDef, rowIdx: number) => this.rowKey(sec, rowIdx))
     }
     .width('100%')
     .backgroundColor($r('app.color.sched_bg'))
@@ -1316,11 +1393,11 @@ export struct SchedulePage {
       Column() {
         Blank()
           .width(SchedulePage.NARROW_LABEL_W)
-          .height(46)
+          .height(GRID_HEADER_H)
           .backgroundColor($r('app.color.surface_variant'))
         ForEach(SECTIONS, (sec: SectionDef, rowIdx: number) => {
           this.sectionLabel(sec, this.rowHeight(rowIdx), SchedulePage.NARROW_LABEL_W)
-        }, (sec: SectionDef) => 'nl' + sec.label)
+        }, (sec: SectionDef, rowIdx: number) => this.rowKey(sec, rowIdx))
       }
       .width(SchedulePage.NARROW_LABEL_W)
       .backgroundColor($r('app.color.surface_variant'))
@@ -1342,7 +1419,7 @@ export struct SchedulePage {
           }
           .width('100%')
           .alignItems(VerticalAlign.Top)
-        }, (sec: SectionDef) => 'nr' + sec.label)
+        }, (sec: SectionDef, rowIdx: number) => this.rowKey(sec, rowIdx))
       }
       .layoutWeight(1)
     }
@@ -1371,90 +1448,114 @@ export struct SchedulePage {
         } else if (!this.timetable.hasAnyCourse(this.weekNumber())) {
           EmptyView({ title: '本周暂无课程', hint: '点击任意空白格可手动添加课程' })
         } else {
-          Scroll() {
-            Column({ space: Theme.GAP }) {
-              if (this.fitsOneScreen()) {
-                this.gridWide()
-              } else {
-                this.gridNarrow()
+          Column({ space: Theme.GAP }) {
+            // ===== 网格：吃掉「备注之上」的全部剩余高度 =====
+            //
+            // 这是「一页装下整周」的实现要点，别改回「内容撑多高就多高」：
+            //   1. Column 先排不参与权重的兄弟（备注/提示），剩下的全给网格；
+            //   2. 网格把这个实测高度回报给 gridAvailH，[rowHeight] 再 5 等分。
+            //   于是 `表头 + 5 行 ≡ 实测高度` 恒成立，与屏幕比例无关。
+            //
+            // 外面仍包一层 Scroll：均分本身不需要滚动，它是**兜底**——
+            // 窗口被拖到极矮（平板自由窗口 / 分屏）时行高会被 GRID_MIN_ROW_H
+            // 顶住，此时内容高于视口，靠它可以够到第 5 行，而不是被裁掉。
+            Scroll() {
+              Column() {
+                if (this.fitsOneScreen()) {
+                  this.gridWide()
+                } else {
+                  this.gridNarrow()
+                }
               }
+              .width('100%')
+            }
+            .width('100%')
+            .layoutWeight(1)
+            .align(Alignment.Top)
+            .onAreaChange((_o: Area, now: Area) => {
+              const h: number = Number(now.height);
+              // 阈值 1vp：避免亚像素抖动来回触发布局（会看到行高颤动）
+              if (h > 0 && Math.abs(h - this.gridAvailH) > 1) {
+                this.gridAvailH = h;
+              }
+            })
 
-              // 备注 + 「已修改」小按钮（与 Flutter 端一致）
-              if (this.timetable.remark.length > 0 ||
-                  (this.fromCache && this.timetable.hasLocalEdits())) {
-                Column({ space: 4 }) {
-                  Row({ space: 8 }) {
-                    if (this.timetable.remark.length > 0) {
-                      Text('备注')
-                        .fontSize(Theme.FS_SMALL)
-                        .fontWeight(FontWeight.Medium)
-                        .fontColor($r('app.color.warning'))
-                    }
-                    // 「已修改」：从顶栏的大标签降级为与「备注」同高的小按钮。
-                    // 它是低频的「恢复」入口，不该占顶栏里最紧俏的一行宽度。
-                    if (this.fromCache && this.timetable.hasLocalEdits()) {
-                      Text('已修改')
-                        .fontSize(Theme.FS_SMALL)
-                        .fontWeight(FontWeight.Medium)
-                        .fontColor($r('app.color.warning'))
-                        .backgroundColor('#24FFA940')
-                        .padding({ left: 8, right: 8, top: 1, bottom: 1 })
-                        .borderRadius(999)
-                        .onClick(() => {
-                          this.confirmReset();
-                        })
-                    }
-                  }
-                  .width('100%')
-
+            // 备注 + 「已修改」小按钮（与 Flutter 端一致）
+            if (this.timetable.remark.length > 0 ||
+                (this.fromCache && this.timetable.hasLocalEdits())) {
+              Column({ space: 4 }) {
+                Row({ space: 8 }) {
                   if (this.timetable.remark.length > 0) {
-                    Text(this.timetable.remark)
-                      .fontSize(Theme.FS_TINY)
-                      .fontColor($r('app.color.text_secondary'))
+                    Text('备注')
+                      .fontSize(Theme.FS_SMALL)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor($r('app.color.warning'))
+                  }
+                  // 「已修改」：从顶栏的大标签降级为与「备注」同高的小按钮。
+                  // 它是低频的「恢复」入口，不该占顶栏里最紧俏的一行宽度。
+                  if (this.fromCache && this.timetable.hasLocalEdits()) {
+                    Text('已修改')
+                      .fontSize(Theme.FS_SMALL)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor($r('app.color.warning'))
+                      .backgroundColor('#24FFA940')
+                      .padding({ left: 8, right: 8, top: 1, bottom: 1 })
+                      .borderRadius(999)
+                      .onClick(() => {
+                        this.confirmReset();
+                      })
                   }
                 }
                 .width('100%')
-                .alignItems(HorizontalAlign.Start)
-                .padding(Theme.GAP)
-                .backgroundColor($r('app.color.surface'))
-                .borderRadius(Theme.RADIUS_SM)
-              }
 
-              // 底部常驻的「当前第 N 周 / 点击课程可编辑」已删除：
-              // 前者在周次选择器上就能看到，后者是操作提示而非状态，
-              // 常驻显示只是平白占掉一行、天天看同一句话。
-              // 唯一需要用户处理的「没设开学日期」保留为一次性提示：
-              if (!this.weekConfigured || this.currentWeekNo <= 0) {
-                Text('未设置开学日期，无法自动定位当前周')
-                  .fontSize(Theme.FS_TINY)
-                  .fontColor($r('app.color.warning'))
-                  .width('100%')
+                if (this.timetable.remark.length > 0) {
+                  Text(this.timetable.remark)
+                    .fontSize(Theme.FS_TINY)
+                    .fontColor($r('app.color.text_secondary'))
+                }
               }
-
-              if (this.serverResetHint.length > 0) {
-                Text(this.serverResetHint)
-                  .fontSize(Theme.FS_TINY)
-                  .fontColor($r('app.color.success'))
-              }
+              .width('100%')
+              .alignItems(HorizontalAlign.Start)
+              .padding(Theme.GAP)
+              .backgroundColor($r('app.color.surface'))
+              .borderRadius(Theme.RADIUS_SM)
             }
-            .width('100%')
-            // 底部留出浮层 dock 的高度，否则备注会被玻璃压住。
-            //
-            // ===== 为什么在 bottomInset 之外再加一截 =====
-            // `bottomInset` 只算了 dock 胶囊本体（56）与它的下边距（36）。
-            // 但 dock 之上还有系统手势条/导航区的安全边距，且胶囊上方的
-            // 投影与圆角会额外遮住十几个 vp —— 只按 92 让位时，手机端
-            // 备注仍会被压住（真机截图确认）。这里统一多留 24。
-            .padding({
-              left: this.isNarrow() ? Theme.GAP_S : Theme.GAP,
-              right: this.isNarrow() ? Theme.GAP_S : Theme.GAP,
-              top: this.isNarrow() ? Theme.GAP_S : Theme.GAP,
-              bottom: (this.isNarrow() ? Theme.GAP_S : Theme.GAP)
-                + Theme.bottomInset() + 24
-            })
+
+            // 底部常驻的「当前第 N 周 / 点击课程可编辑」已删除：
+            // 前者在周次选择器上就能看到，后者是操作提示而非状态，
+            // 常驻显示只是平白占掉一行、天天看同一句话。
+            // 唯一需要用户处理的「没设开学日期」保留为一次性提示：
+            if (!this.weekConfigured || this.currentWeekNo <= 0) {
+              Text('未设置开学日期，无法自动定位当前周')
+                .fontSize(Theme.FS_TINY)
+                .fontColor($r('app.color.warning'))
+                .width('100%')
+            }
+
+            if (this.serverResetHint.length > 0) {
+              Text(this.serverResetHint)
+                .fontSize(Theme.FS_TINY)
+                .fontColor($r('app.color.success'))
+            }
           }
+          .width('100%')
+          // 这层 Column 自己也是「权重 1」：它把筛选栏以下全吃掉，
+          // 再由内部把「备注」之外的部分交给网格（见上面那段说明）。
           .layoutWeight(1)
-          .align(Alignment.Top)
+          // 底部留出浮层 dock 的高度，否则备注会被玻璃压住。
+          //
+          // ===== 为什么在 bottomInset 之外再加一截 =====
+          // `bottomInset` 只算了 dock 胶囊本体（56）与它的下边距（36）。
+          // 但 dock 之上还有系统手势条/导航区的安全边距，且胶囊上方的
+          // 投影与圆角会额外遮住十几个 vp —— 只按 92 让位时，手机端
+          // 备注仍会被压住（真机截图确认）。这里统一多留 24。
+          .padding({
+            left: this.isNarrow() ? Theme.GAP_S : Theme.GAP,
+            right: this.isNarrow() ? Theme.GAP_S : Theme.GAP,
+            top: this.isNarrow() ? Theme.GAP_S : Theme.GAP,
+            bottom: (this.isNarrow() ? Theme.GAP_S : Theme.GAP)
+              + Theme.bottomInset() + 24
+          })
         }
       }
       .width('100%')
