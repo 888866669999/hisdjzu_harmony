@@ -1,0 +1,695 @@
+/*
+ * QzApi：强智教务系统接口封装
+ *
+ * 全部接口均基于服务端渲染页面，返回解析后的模型对象。
+ */
+import { http } from '@kit.NetworkKit';
+import { HttpClient, HttpResponse, FormField } from './HttpClient';
+import { CookieJar } from './CookieJar';
+import { AppError, ErrKind } from '../common/Result';
+import { Logger } from '../common/Logger';
+import { QzEncoder } from '../crypto/QzEncoder';
+import { HtmlLite } from '../parser/HtmlLite';
+import { TimetableParser } from '../parser/TimetableParser';
+import { ScoreParser } from '../parser/ScoreParser';
+import { ProfileParser } from '../parser/ProfileParser';
+import { WeekCalendarParser } from '../parser/WeekCalendarParser';
+import { PlanParser } from '../parser/PlanParser';
+import { ElectiveParser } from '../parser/ElectiveParser';
+import { ClassroomParser } from '../parser/ClassroomParser';
+import { Timetable, ScoreRecord, StudentProfile, WeekDate, ChoiceItem,
+  PlanDetail, ElectiveReport, ElectiveCourse } from '../model/Models';
+import { ClassroomResult } from '../model/ClassroomModels';
+import { PrefStore } from '../data/PrefStore';
+import {
+  BASE_ORIGIN, PATH_LOGIN_PAGE, PATH_CAPTCHA, PATH_LOGON, PATH_MAIN,
+  PATH_TIMETABLE, PATH_SCORE_LIST, PATH_SCORE_QUERY, PATH_PROFILE,
+  PATH_WEEK_CALENDAR, PATH_PLAN_DETAIL, PATH_ELECTIVE, PATH_ELECTIVE_DETAIL,
+  PATH_CLASSROOM, PATH_CLASSROOM_QUERY, PATH_CLASSROOM_AJAX, DEFAULT_SECTION_MODE_ID,
+  AS_LOGGED_IN, AS_HAS_CREDENTIAL
+} from '../common/Constants';
+
+/**
+ * 登录失败的类别。
+ *
+ * 为什么需要机器可读的类别：自动登录重试**只能**在「验证码错」这类
+ * 可恢复失败上触发。若靠比对界面文案来决定，一旦服务端措辞变化就会
+ * 误判成可重试 —— 那意味着拿错误的账号密码反复 POST，直接踩账号锁定。
+ * 因此把判断收敛到唯一一处，并让调用方按类别决策。
+ */
+export enum LoginFailKind {
+  /** 没失败 */
+  NONE = 0,
+  /** 验证码不对（可换图重试） */
+  CAPTCHA = 1,
+  /** 账号或密码不对（绝不重试） */
+  CREDENTIAL = 2,
+  /** 会话/握手异常（可重试一次，但不是验证码问题） */
+  SESSION = 3,
+  /** 服务端拒绝了本次登录（限流/维护等），不宜立刻重试 */
+  REJECTED = 4,
+  /** 其他无法归类 */
+  UNKNOWN = 5
+}
+
+/** 登录结果 */
+export class LoginResult {
+  success: boolean = false;
+  message: string = '';
+  /** 失败类别（成功时为 NONE） */
+  kind: LoginFailKind = LoginFailKind.NONE;
+
+  constructor(success: boolean, message: string) {
+    this.success = success;
+    this.message = message;
+  }
+
+  /** 便捷构造：带失败类别 */
+  static fail(message: string, kind: LoginFailKind): LoginResult {
+    const r: LoginResult = new LoginResult(false, message);
+    r.kind = kind;
+    return r;
+  }
+}
+
+/** 教室查询页的可选项 */
+export class ClassroomOptions {
+  /** 校区，元素形如 "3|章丘校区"（value|label） */
+  campuses: string[] = [];
+  /** 学期代码 */
+  semesters: string[] = [];
+}
+
+export class QzApi {
+  private client: HttpClient;
+
+  /**
+   * 正在进行的会话探测。
+   *
+   * 为什么必须串行化：启动时有两处会各自探测一次会话
+   * （`AppState.verifySessionInBackground` 与 `Index.trySilentRenewal`）。
+   * 两条请求带着**同一个 JSESSIONID** 并发打到服务器，一旦服务端在响应中
+   * 轮换会话，后到的那条就可能被判为未登录 —— 于是 `isSessionAlive()`
+   * 出现假阴性，进而触发一次完全不必要的重新登录（取验证码 + 提交登录），
+   * 而这次登录又会再次轮换会话，干扰其它在途请求。
+   *
+   * 让并发调用共享同一个 Promise，既去掉重复请求，也消除这个竞态。
+   */
+  private static probeInFlight: Promise<boolean> | null = null;
+
+  constructor(jar: CookieJar) {
+    this.client = new HttpClient(jar);
+  }
+
+  cookieJar(): CookieJar {
+    return this.client.cookieJar();
+  }
+
+  /**
+   * 获取验证码图片。
+   * 关键：必须与登录请求共用同一个会话，验证码才有效。
+   */
+  async fetchCaptcha(): Promise<ArrayBuffer> {
+    // 1) 先取一次登录页，建立**作用域为 /jsxsd 的会话**。
+    //
+    // ===== 为什么必须走这一步（实测）=====
+    // 只请求验证码也能拿到 cookie，但那一个是 `Path=/`；
+    // 而登录接口在 `/jsxsd/xk/LoginToXk` 下，浏览器发 Cookie 时按路径匹配，
+    // `/jsxsd` 这个更"深"的路径不会带上 `Path=/` 之外的东西 ——
+    // 结果是**服务端每次都判定验证码错误**（会话与验证码对不上），
+    // 而界面只显示「验证码错误」，完全看不出是路径作用域的问题。
+    //
+    // 失败也继续：也许已有可用会话，让验证码那一步的错误提示更贴切。
+    try {
+      await this.client.get(BASE_ORIGIN + PATH_LOGIN_PAGE);
+    } catch (e) {
+      Logger.warn('login page prefetch failed, continue');
+    }
+
+    // 2) 取验证码图（与登录同一个 /jsxsd 上下文）
+    const url: string = BASE_ORIGIN + PATH_CAPTCHA;
+    // 诊断价值：验证码与它绑定的会话必须和后续提交登录时一致，
+    // 否则服务端会判定「验证码错误」。这一行把会话摘要打出来便于比对。
+    const before: string = this.client.cookieJar().toLogSummary();
+    const buf: ArrayBuffer = await this.client.getBinary(url);
+    const after: string = this.client.cookieJar().toLogSummary();
+    if (before !== after) {
+      Logger.info('captcha refresh rotated session: ' + after);
+    }
+    return buf;
+  }
+
+  /**
+   * 登录。
+   *
+   * ===== 山建的流程比移植源（山财）短一步：**没有握手** =====
+   *   山财：POST /Logon.do?method=logon&flag=sess 拿 scode#sxh → 按位插字符 → 提交
+   *   山建：直接 POST /jsxsd/xk/LoginToXk，encoded 就是两个 Base64 用 %%% 拼起来
+   * 照搬山财那份握手会得到服务端一句通用的「用户名或密码错误」，
+   * 完全看不出是流程错了。
+   *
+   * 表单字段与**真实页面逐字对齐**（少一个就会被判成无效登录）：
+   *   · `loginMethod=LoginToXk` 是页面里的隐藏字段，必须带；
+   *   · `userPassword` 要**原样提交**（页面 JS 里写着 `userPassword.value = pwd`，
+   *     服务端两者都读）。留空会被回「账号或密码不能为空」—— 实测踩过。
+   */
+  async login(account: string, password: string, captcha: string): Promise<LoginResult> {
+    // 诊断：登录前的会话状态。
+    // 用 toLogSummary 而不是 toHeader：后者会把 JSESSIONID 原文写进系统日志，
+    // 而那是「持有即可用」的凭据（见 CookieJar.toLogSummary 的说明）。
+    Logger.info('login start, jar=[' + this.client.cookieJar().toLogSummary() + ']');
+
+    // 1) 算 encoded（纯本地计算，无网络往返）
+    const encoded: string = QzEncoder.buildEncoded(account, password);
+    if (encoded.length === 0) {
+      // 界面本应先拦住；这里兜底防「用空凭据打接口」
+      return LoginResult.fail('请输入账号与密码', LoginFailKind.CREDENTIAL);
+    }
+    // 注意：**不打印密码长度**。它是密码的派生量，配合「密码通常不长」这一常识
+    // 能缩小猜测空间，属于没必要承担的风险；排查时看 encoded 长度即可。
+    Logger.info('encoded len=' + encoded.length);
+
+    // 2) 提交登录：**让 HTTP 客户端自己跟随重定向**
+    //
+    // ===== 为什么不自己读 Location（踩过，别再改回去）=====
+    // Flutter 端用的是「关掉自动重定向 → 自己读 302 的 Location → 再 GET 一次」。
+    // 那套在 Dart 上成立（`followRedirects: false` 会把 302 响应交回来），
+    // 但**在 HarmonyOS 上会直接把登录判成网络故障**：
+    //
+    //   登录成功 → 服务器回 302 + ticket
+    //   → 我们设的 `maxRedirects: 0` 让 http 模块抛 **2300047**
+    //     （SDK 文档：重定向次数超过上限即返回该错误码，"0 表示禁用重定向"
+    //      的含义是「一跳都不许」，而不是「把重定向响应交给我」）
+    //   → 异常被归成 ErrKind.NETWORK → 界面显示「网络连接失败，请检查网络」
+    //
+    // 用户看到的就是「登录一直提示无网络」，可实际上服务器已经认了凭据、
+    // 会话也已建立 —— 退出登录页再进来反而发现已经登上去了。
+    //
+    // 跟随重定向（默认 30 跳）之后，最终拿到的就是学生端主页，
+    // 因此**判定只看最终正文**：是登录页就是失败，否则成功。
+    // 表单字段与**真实页面逐字对齐**（少一个就会被判成无效登录）：
+    //   · `loginMethod=LoginToXk` 是页面里的隐藏字段，必须带；
+    //   · `userPassword` 要**原样提交**（页面 JS 里写着 `userPassword.value = pwd`，
+    //     服务端两者都读）。留空会被回「账号或密码不能为空」—— 实测踩过。
+    const fields: FormField[] = [
+      new FormField('loginMethod', 'LoginToXk'),
+      new FormField('userAccount', account),
+      new FormField('userPassword', password),
+      new FormField('RANDOMCODE', captcha),
+      new FormField('encoded', encoded)
+    ];
+    const res: HttpResponse = await this.client.postForm(BASE_ORIGIN + PATH_LOGON, fields);
+    Logger.info('login response status=' + res.status + ' bodyLen=' + res.body.length +
+      ' jar=[' + this.client.cookieJar().toLogSummary() + ']');
+
+    // 3) 仍保留「自己读 Location」的分支：万一某个版本没跟随重定向（或将来有人
+    //    又把 maxRedirects 调小了），这条路径仍能完成 ticket 换会话。
+    const location: string = res.header('location');
+    if (location.length > 0) {
+      const target: string = QzApi.absolute(location);
+      Logger.info('login redirect -> ' + QzApi.maskTicket(target));
+      const uni: HttpResponse = await this.client.get(target);
+      Logger.info('ticket exchange status=' + uni.status + ' bodyLen=' + uni.body.length);
+      if (HtmlLite.isLoginPage(uni.body)) {
+        return LoginResult.fail('登录未能建立会话，请重试', LoginFailKind.SESSION);
+      }
+      return new LoginResult(true, '登录成功');
+    }
+
+    // 4) 主判定：跟随重定向后的最终正文
+    if (HtmlLite.isLoginPage(res.body)) {
+      const hint: string = QzApi.extractError(res.body);
+      Logger.warn('login rejected by server: hint=' + hint);
+      const kind: LoginFailKind = QzApi.classifyFail(hint);
+      return LoginResult.fail(hint.length > 0 ? hint : '账号或密码或验证码有误', kind);
+    }
+    if (res.body.indexOf('xsMain') >= 0 || res.body.indexOf('教学一体化服务平台') >= 0 ||
+      res.body.indexOf('framework') >= 0) {
+      return new LoginResult(true, '登录成功');
+    }
+    return LoginResult.fail('登录失败，请检查账号密码与验证码', LoginFailKind.UNKNOWN);
+  }
+
+  /**
+   * 按服务端错误原文判定失败类别。
+   *
+   * 只把明确的「验证码」措辞归为可重试；其余一律保守归类，
+   * 宁可不重试也不要把账号密码类的失败当成验证码错去反复 POST。
+   */
+  private static classifyFail(hint: string): LoginFailKind {
+    if (hint.length === 0) {
+      return LoginFailKind.UNKNOWN;
+    }
+    if (hint.indexOf('验证码') >= 0) {
+      return LoginFailKind.CAPTCHA;
+    }
+    if (hint.indexOf('密码') >= 0 || hint.indexOf('账号') >= 0 ||
+      hint.indexOf('用户名') >= 0) {
+      return LoginFailKind.CREDENTIAL;
+    }
+    if (hint.indexOf('会话') >= 0 || hint.indexOf('超时') >= 0) {
+      return LoginFailKind.SESSION;
+    }
+    return LoginFailKind.UNKNOWN;
+  }
+
+  /** 把 Location 里的相对地址补成绝对地址 */
+  private static absolute(loc: string): string {
+    if (loc.startsWith('http://') || loc.startsWith('https://')) {
+      return loc;
+    }
+    if (loc.startsWith('/')) {
+      return BASE_ORIGIN + loc;
+    }
+    return BASE_ORIGIN + '/' + loc;
+  }
+
+  /** 日志用：隐去 ticket 内容，避免敏感串进日志 */
+  private static maskTicket(url: string): string {
+    const i: number = url.indexOf('ticket=');
+    if (i < 0) {
+      return url;
+    }
+    return url.substring(0, i + 7) + '***';
+  }
+
+  /**
+   * 会话是否仍然有效。
+   *   - true  ：服务器返回了正常页面，会话可用（顺带刷新 cookie）
+   *   - false ：服务器明确要求登录（返回了登录页或重定向到登录）
+   *   - 抛异常：网络层失败（不在校园网、超时等），调用方应保持原状态而不是登出
+   */
+  async isSessionAlive(): Promise<boolean> {
+    // 并发调用共享同一次探测结果（见 probeInFlight 的说明）
+    if (QzApi.probeInFlight !== null) {
+      return await QzApi.probeInFlight;
+    }
+    QzApi.probeInFlight = this.probeSession();
+    try {
+      return await QzApi.probeInFlight;
+    } finally {
+      QzApi.probeInFlight = null;
+    }
+  }
+
+  /** 真正的探测动作；只应由 isSessionAlive 调用（它负责去重） */
+  private async probeSession(): Promise<boolean> {
+    const res: HttpResponse = await this.client.get(BASE_ORIGIN + PATH_MAIN);
+    // 请求可能被重定向到登录页；两种判据都视为失效
+    const location: string = res.header('location');
+    const isLogin: boolean = HtmlLite.isLoginPage(res.body);
+    Logger.info('session probe: status=' + res.status + ' len=' + res.body.length +
+      ' isLogin=' + isLogin + ' loc=[' + (location.length > 0 ? 'redirect' : '') + ']');
+    if (location.length > 0 && (location.indexOf('Logon') >= 0 || location.indexOf('logon') >= 0)) {
+      return false;
+    }
+    if (isLogin) {
+      return false;
+    }
+    return true;
+  }
+
+  /** 兼容旧调用：仅用于「确定能区分网络错误」的场景 */
+  async checkSession(): Promise<boolean> {
+    return await this.isSessionAlive();
+  }
+
+  /** 课程表 */
+  async getTimetable(semester: string, week: string): Promise<Timetable> {
+    const html: string = await this.getTimetableHtml(semester, week);
+    const tt: Timetable = TimetableParser.parse(html);
+    Logger.info('timetable parsed: cells=' + tt.cells.length);
+    return tt;
+  }
+
+  /**
+   * 课程表页**原文**。
+   *
+   * 为什么单独开一个方法：课表页的节次行首格自带起止时刻
+   * （`第一大节 (01,02小节) 07:50-09:25`），那是本校**唯一**公开的作息来源
+   * （教务处官网只发校历 PDF、没有作息表）。作息要从**原文**里解析，
+   * 模型里没有这个信息。与成绩页的 getScoresHtml 同一手法。
+   */
+  async getTimetableHtml(semester: string, week: string): Promise<string> {
+    const fields: FormField[] = [];
+    if (semester.length > 0) {
+      fields.push(new FormField('xnxq01id', semester));
+    }
+    // 只把**纯数字周次**提交给服务器。
+    //
+    // 为什么必须在这里挡一道：客户端用 'auto' 表示「跟随本周」、空串表示「全部」，
+    // 这两个都是**本地语义**，服务器只认数字。把 'auto' 当 zc 提交上去，
+    // 未登录时会被登录页短路（所以离线怎么测都「正常」），而一旦会话有效、
+    // 服务器真正去解析这个参数，就会返回 404 空响应 ——
+    // 用户看到的是「课表打不开」，且点多少次重试都不会成功。
+    //
+    // 与 Flutter 端保持一致：取网络数据时不带周次，取回后再按本地周次过滤
+    // （见 SchedulePage.weekNumber / displayWeek）。
+    if (week.length > 0) {
+      if (/^\d+$/.test(week)) {
+        fields.push(new FormField('zc', week));
+      } else {
+        Logger.warn('dropped non-numeric week param: ' + week);
+      }
+    }
+    let res: HttpResponse;
+    if (fields.length > 0) {
+      res = await this.client.postForm(BASE_ORIGIN + PATH_TIMETABLE, fields);
+    } else {
+      res = await this.client.get(BASE_ORIGIN + PATH_TIMETABLE);
+    }
+    this.checkResponse(res);
+    Logger.info('timetable fetch: http=' + res.status + ' len=' + res.body.length +
+      ' hasKbtable=' + (res.body.indexOf('kbtable') >= 0));
+    return res.body;
+  }
+
+  /** 成绩 */
+  async getScores(semester: string): Promise<ScoreRecord[]> {
+    return ScoreParser.parse(await this.getScoresHtml(semester));
+  }
+
+  /**
+   * 成绩页**原文**。
+   *
+   * 缓存层存的是原文（理由见 data/PageCache.ets）：解析器是「解读页面」的
+   * 唯一真相，缓存数据走同一条解析路径，解析器修好 bug 后旧缓存自动被正确重读，
+   * 不需要改缓存版本号，也不会出现「模型加字段、序列化器忘了同步」那类静默错误。
+   */
+  async getScoresHtml(semester: string): Promise<string> {
+    let url: string = BASE_ORIGIN + PATH_SCORE_LIST;
+    if (semester.length > 0) {
+      url = url + '?kksj=' + encodeURIComponent(semester);
+    }
+    const res: HttpResponse = await this.client.get(url);
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /** 成绩查询页的学期筛选项 */
+  async getScoreSemesters(): Promise<ChoiceItem[]> {
+    return ScoreParser.readSemesters(await this.getScoreSemestersHtml());
+  }
+
+  /** 成绩学期列表页原文 */
+  async getScoreSemestersHtml(): Promise<string> {
+    const res: HttpResponse = await this.client.get(BASE_ORIGIN + '/jsxsd/kscj/cjcx_query');
+    this.checkResponse(res);
+    Logger.info('score semesters: http=' + res.status + ' len=' + res.body.length +
+      ' hasSelect=' + (res.body.indexOf('<select') >= 0));
+    return res.body;
+  }
+
+  /** 个人信息（学籍卡片） */
+  async getProfile(): Promise<StudentProfile> {
+    return ProfileParser.parse(await this.getProfileHtml());
+  }
+
+  /** 个人信息页原文 */
+  async getProfileHtml(): Promise<string> {
+    const res: HttpResponse = await this.client.get(BASE_ORIGIN + PATH_PROFILE);
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /**
+   * 教学周历页原文。
+   *
+   * [semester] 非空时取指定学年那学期（服务端的表单是
+   * `post xnxq01id=<学期>`，不传则返回当前学期）。
+   *
+   * 这个页面是**唯一权威且能随年份自动更新**的校历数据源：
+   * 它给出「第 N 周 ←→ 周一日期」的完整对照，学校每学期排课时录入。
+   * 学校官网那张校历图只是它的图片版，图里能算的这里都有结构化字段。
+   */
+  async getWeekCalendarHtml(semester: string): Promise<string> {
+    let res: HttpResponse;
+    if (semester.length === 0) {
+      res = await this.client.get(BASE_ORIGIN + PATH_WEEK_CALENDAR);
+    } else {
+      const fields: FormField[] = [new FormField('xnxq01id', semester)];
+      res = await this.client.postForm(BASE_ORIGIN + PATH_WEEK_CALENDAR, fields);
+    }
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /** 教学周历：周次与日期对照 */
+  async getWeekCalendar(semester: string): Promise<WeekDate[]> {
+    return WeekCalendarParser.parseWeekDates(await this.getWeekCalendarHtml(semester));
+  }
+
+  /** 培养方案明细（含培养方案的课程设置总表与 PDF 附件地址） */
+  async getPlanDetail(): Promise<PlanDetail> {
+    return PlanParser.parse(await this.getPlanHtml());
+  }
+
+  /** 培养方案页原文 */
+  async getPlanHtml(): Promise<string> {
+    const res: HttpResponse = await this.client.get(BASE_ORIGIN + PATH_PLAN_DETAIL);
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /** 通选课修读情况 */
+  async getElectiveReport(): Promise<ElectiveReport> {
+    return ElectiveParser.parse(await this.getElectiveHtml());
+  }
+
+  /** 通选课页原文 */
+  async getElectiveHtml(): Promise<string> {
+    const res: HttpResponse = await this.client.get(BASE_ORIGIN + PATH_ELECTIVE);
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /**
+   * 某大类下的课程明细（详情页原文）。
+   *
+   * 大类名来自主页解析结果，属**服务端数据**（不是用户输入），
+   * 但仍按查询参数编码，避免名字里的特殊字符破坏 URL。
+   */
+  async getElectiveCoursesHtml(categoryName: string): Promise<string> {
+    const url: string = BASE_ORIGIN + PATH_ELECTIVE_DETAIL +
+      '?kctxmc=' + encodeURIComponent(categoryName);
+    const res: HttpResponse = await this.client.get(url);
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /** 某大类下的课程明细 */
+  async getElectiveCourses(categoryName: string): Promise<ElectiveCourse[]> {
+    return ElectiveParser.parseDetail(await this.getElectiveCoursesHtml(categoryName));
+  }
+
+  // ==================== 空教室查询 ====================
+
+  /** 教室查询页的选项（校区与学期） */
+  async getClassroomOptions(): Promise<ClassroomOptions> {
+    return QzApi.parseClassroomOptions(await this.getClassroomOptionsHtml());
+  }
+
+  /** 空教室查询页原文 */
+  async getClassroomOptionsHtml(): Promise<string> {
+    const res: HttpResponse = await this.client.get(BASE_ORIGIN + PATH_CLASSROOM);
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /** 校区/学期选项的解析（静态，供缓存层复用） */
+  static parseClassroomOptions(body: string): ClassroomOptions {
+    const opt: ClassroomOptions = new ClassroomOptions();
+    opt.campuses = ClassroomParser.parseCampuses(body);
+    opt.semesters = ClassroomParser.parseSemesters(body);
+    return opt;
+  }
+
+  /**
+   * 教学楼列表原文。
+   *
+   * ===== 山建这道门是关着的（实测）=====
+   * 正常形态是 GET `jsjy_processAjax?xqid=…&requestType=jxl`，返回 JSON 数组。
+   * 但本校无论怎么组合请求头（裸请求 / `X-Requested-With` / jQuery 的 JSON
+   * `Accept` / 带发起页 `Referer` / 去掉 `Origin` / URL 加不加前导 `&`），
+   * 一律返回 736 字节的「提示：非法访问！」—— 每种组合的响应长度完全一致，
+   * 与「缺某个头」的典型症状不同，是服务端整体关闭了这个端点。
+   *
+   * 因此**楼栋筛选改在客户端做**：查询不带楼栋参数、取回该校区全部教室，
+   * 再从教室名（`博文馆407`、`产融B202`）推导楼栋分组（见 ClassroomFinder）。
+   * 这个方法保留下来仅供别校/未来复用，界面不再调用。
+   */
+  async getBuildingsHtml(campusId: string): Promise<string> {
+    const url: string = BASE_ORIGIN + PATH_CLASSROOM_AJAX +
+      '?xqid=' + encodeURIComponent(campusId) + '&requestType=jxl';
+    const res: HttpResponse = await this.client.get(url);
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /**
+   * 教室占用页原文（POST 表单）。
+   *
+   * `buildingId` 传空串 = 服务端返回该校区**全部**教室；楼栋筛选在客户端做
+   * （原因见 getBuildingsHtml）。这样还少一次请求。
+   *
+   * `jszt` 传空 = 不限教室状态。早先沿用移植源的 `jszt=8`（「完全空闲」），
+   * 那是把服务端当筛选用 —— 结果只回「整周完全空闲」的教室，实测全校区
+   * 只剩 1 间，而客户端本来就会按 isBusy(day, week, section) 自己判空闲。
+   */
+  async getClassroomUsageHtml(semester: string, campusId: string, buildingId: string,
+    sectionRow: number): Promise<string> {
+    const fields: FormField[] = [
+      new FormField('typewhere', 'jszq'),
+      new FormField('xnxqh', semester),
+      new FormField('gnq_mh', ''),
+      new FormField('jsmc_mh', ''),
+      new FormField('syjs0601id', ''),
+      new FormField('xqbh', campusId),
+      new FormField('jxqbh', ''),
+      new FormField('jxlbh', buildingId),
+      new FormField('jsbh', ''),
+      new FormField('bjfh', '='),
+      new FormField('rnrs', ''),
+      new FormField('jszt', ''),
+      new FormField('zc', ''),
+      new FormField('zc2', ''),
+      new FormField('xq', ''),
+      new FormField('xq2', ''),
+      new FormField('jc', ''),
+      new FormField('jc2', ''),
+      new FormField('kbjcmsid', DEFAULT_SECTION_MODE_ID)
+    ];
+    const res: HttpResponse = await this.client.postForm(
+      BASE_ORIGIN + PATH_CLASSROOM_QUERY, fields);
+    // 「非法访问」由 checkResponse 统一拦截（见那里的说明）——
+    // 早先只在这一个方法里单独判，别的接口被拒时页面会静默显示「暂无数据」。
+    this.checkResponse(res);
+    return res.body;
+  }
+
+  /**
+   * 按校区取教学楼列表。
+   * 该接口返回 JSON 数组（Content-Type 虽为 text/html，但内容是 JSON）。
+   */
+  async getBuildings(campusId: string): Promise<ChoiceItem[]> {
+    return QzApi.parseBuildings(await this.getBuildingsHtml(campusId));
+  }
+
+  /**
+   * 查询某校区某节次的占用情况。
+   *
+   * 注意：**故意不传周次**。服务端的 `zc`/`zc2` 在「被借用」记录上不生效，
+   * 且筛选后会丢掉全周空闲的教室（真正空闲的那批恰好都在被丢掉的行里）。
+   * 拿到全学期占用文本后由客户端按周判断，见 ClassroomModels 顶部说明。
+   *
+   * 原文与解析分开：解析要带上 sectionRow（节次决定读哪一列），
+   * 所以缓存存原文，取出时按当前的 sectionRow 解析。
+   */
+  async getClassroomUsage(semester: string, campusId: string, buildingId: string,
+    sectionRow: number): Promise<ClassroomResult> {
+    return ClassroomParser.parseResult(
+      await this.getClassroomUsageHtml(semester, campusId, buildingId, sectionRow), sectionRow);
+  }
+
+  /**
+   * 解析教学楼 JSON：形如 [{"dm":"3","dmmc":"7号楼"},...]。
+   * 服务端 Content-Type 是 text/html，但内容是 JSON，因此不能用 content-type 判断。
+   * 返回 label=dmmc / value=dm 的选项；末尾附一个「全部教学楼」选项（value 为空）。
+   *
+   * 公开为 static 是为了让缓存层复用同一个解析器（见 data/PageCache.ets）。
+   */
+  static parseBuildings(body: string): ChoiceItem[] {
+    const out: ChoiceItem[] = [];
+    out.push(new ChoiceItem('全部教学楼', ''));
+    const text: string = body === undefined || body === null ? '' : body.trim();
+    if (text.length === 0 || text.charAt(0) !== '[') {
+      Logger.warn('buildings response is not a JSON array');
+      return out;
+    }
+    // 用正则逐条取 dm / dmmc，避免依赖 JSON.parse 对上游脏数据的容忍度
+    const re: RegExp = /"dm"\s*:\s*"([^"]*)"\s*,\s*"dmmc"\s*:\s*"([^"]*)"/g;
+    const ms: string[] | null = text.match(re);
+    if (ms === null) {
+      return out;
+    }
+    for (let i = 0; i < ms.length; i++) {
+      const m: RegExpMatchArray | null = ms[i].match(/"dm"\s*:\s*"([^"]*)"\s*,\s*"dmmc"\s*:\s*"([^"]*)"/);
+      if (m !== null && m.length >= 3 && m[1].length > 0) {
+        out.push(new ChoiceItem(m[2], m[1]));
+      }
+    }
+    Logger.info('buildings parsed: ' + (out.length - 1));
+    return out;
+  }
+
+  /**
+   * 业务响应的统一检查：先看 HTTP 状态，再看是否被打回登录页。
+   *
+   * 为什么要检查状态码：会话失效或后端异常时，服务端可能返回 4xx/5xx 错误页
+   * 而不是登录页。若不检查，解析器会把错误页解析成「空数据」，
+   * 界面显示「暂无数据」—— 用户完全看不出其实是请求失败了。
+   *
+   * 为什么排除带 location 的响应：登录流程**依赖** 404 + `location: ...ticket=...`
+   * 这个形态来拿到票据（见 login()），所以有 location 时交给调用方自行判断。
+   */
+  private checkResponse(res: HttpResponse): void {
+    if (res.status >= 400 && res.header('location').length === 0) {
+      Logger.warn('business request failed: http=' + res.status);
+      throw new AppError(ErrKind.SERVER, '教务系统响应异常，请稍后重试', 'http=' + res.status);
+    }
+    this.ensureAuthed(res.body);
+    // ===== 「非法访问」是 HTTP 200 的正常响应体，必须单独认出来 =====
+    //
+    // 服务端对参数/路径不对的请求不回 4xx，而是回一页
+    // 「提示：非法访问！」（实测 736 字节，且**任何请求头组合都一样**）。
+    // 不拦的话它会一路走到解析器 —— 解析不出任何东西，
+    // 于是页面显示「暂无数据」，用户以为「这学期就是没成绩 / 没课」，
+    // 而真正的原因（请求被拒）完全不露痕迹。
+    // Flutter 端已把它做成所有业务请求的公共检查，这里保持一致。
+    const body: string = res.body;
+    if (body !== null && body !== undefined && body.indexOf('非法访问') >= 0) {
+      Logger.warn('business request rejected as illegal-access');
+      throw new AppError(ErrKind.SERVER, '教务系统拒绝了这次请求，请稍后重试',
+        'illegal-access page');
+    }
+  }
+
+  /**
+   * 业务请求返回登录页 = 会话确实失效。
+   *
+   * 处理方式：**只抛错，不在这里置「等待重新验证」标记**。
+   *
+   * 为什么不能直接置标记（这是个踩过的坑）：
+   *   `ensureAuthed` 是所有业务请求的公共出口，其中也包括**页面首次自动加载**
+   *   （进入某页 → 拉数据）。若在这里就置标记，用户一进页面就会看到
+   *   「需要重新登录」弹窗 —— 而他可能只是想看一眼本地缓存的课表。
+   *   正确顺序是「先静默续期，失败才弹窗」，而这个判断需要知道调用方是
+   *   「自动加载」还是「用户主动操作」，只有页面自己知道。
+   *   因此把置标记的时机交给页面（见 `ReAuthService.recoverIfExpired`）。
+   *
+   * 若登录页里确实带着交互提示，仍然抛出 AUTH_EXPIRED —— 页面据此决定
+   * 是静默续期、内联提示还是弹窗。
+   */
+  private ensureAuthed(body: string): void {
+    if (!HtmlLite.isLoginPage(body)) {
+      return;
+    }
+    throw new AppError(ErrKind.AUTH_EXPIRED, '登录状态已失效，需要重新验证');
+  }
+
+  /** 从登录失败页提取错误提示 */
+  private static extractError(body: string): string {
+    const m: RegExpMatchArray | null = body.match(/id="showMsg"[^>]*>([^<]*)</i);
+    if (m !== null) {
+      const t: string = HtmlLite.decode(m[1]).trim();
+      if (t.length > 0) {
+        return t;
+      }
+    }
+    if (body.indexOf('验证码') >= 0) {
+      return '验证码错误，请重新输入';
+    }
+    return '';
+  }
+
+}
