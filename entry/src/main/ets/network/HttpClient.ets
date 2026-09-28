@@ -87,12 +87,16 @@ export class HttpClient {
   }
 
   /**
-   * 通用二进制下载（验证码、PDF 等）。
+   * 通用二进制下载（验证码图片等）。
    * 与 getBinary 的区别：会校验 HTTP 状态码，并允许自定义 Accept 与错误文案。
+   *
+   * （早先培养方案 PDF 附件的下载也走这里；实测本校培养方案页没有任何附件，
+   * 该功能与 data/PdfStore 已整块删除。校历附件的下载在 CampusCalendarService
+   * 里，自带逐跳 UrlGuard 校验与 304 处理，与本方法不是同一条路径。）
    */
   async fetchBinary(url: string, accept: string, failMessage: string): Promise<ArrayBuffer> {
-    // SSRF 防护：这些地址可能来自**远端页面解析结果**（培养方案的附件路径），
-    // 属不可信输入。发请求前必须校验协议与主机，
+    // SSRF 防护：地址可能是**远端页面解析结果或用户输入**（校历公告页）。
+    // 属不可信输入，发请求前必须校验协议与主机，
     // 拒绝 localhost / 环回 / 私有 / 保留地址（见 UrlGuard）。
     try {
       UrlGuard.check(url);
@@ -118,7 +122,7 @@ export class HttpClient {
         header: headers,
         connectTimeout: HTTP_CONNECT_TIMEOUT,
         readTimeout: HTTP_READ_TIMEOUT,
-        // 同上：验证码/PDF 这类二进制内容绝不能命中缓存
+        // 同上：验证码这类二进制内容绝不能命中缓存
         usingCache: false,
         expectDataType: http.HttpDataType.ARRAY_BUFFER
       });

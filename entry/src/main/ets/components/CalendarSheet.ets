@@ -451,8 +451,9 @@ export struct CalendarSheet {
               //
               // ===== 本校是 PDF，不是图片 =====
               // 教务处公告挂的是 PDF 附件；本页不做 PDF 内嵌渲染
-              // （理由见 PlanPage 顶部：内嵌 PDF 依赖设备能力、还要自绘
-              // 六百行组件，交给系统阅读器做得更好）。这里只列文件名，
+              // （内嵌渲染依赖特定设备的 PDF 能力、还要自绘六百行组件，
+              // 交给系统阅读器做得更好 —— 培养方案页当初删掉 PDF 卡片
+              // 也是同一条理由）。这里只列文件名，
               // 点一下交给外部应用打开；图片（参考实现那边是图片）照旧直接显示。
               //
               // 本校通常为空（附件是可选来源）—— 不显示即可，月历部分
@@ -586,7 +587,7 @@ export struct CalendarSheet {
    * 用其它应用打开本地附件。
    *
    * 必须转成**文件共享 URI** 再交出去：沙箱路径直接传，对方应用没有
-   * 读取权限，会以「打不开」告终（与 PlanPage.openExternally 同一原因）。
+   * 读取权限，会以「打不开」告终。
    */
   private async openAttachment(path: string): Promise<void> {
     const ctx: common.UIAbilityContext | null = ContextHolder.get();

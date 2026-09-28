@@ -322,7 +322,7 @@ export class TimetableStore {
     };
     // 用 try/finally 保证文件句柄一定关闭：writeSync 若抛错而没关闭，
     // fd 会永久泄漏 —— 课表保存是高频路径（每次编辑/每次拉取都写），
-    // 反复失败最终会耗尽句柄。与 PdfStore.download 保持同一写法。
+    // 反复失败最终会耗尽句柄。与 PageCache.writeText 保持同一写法。
     let file: fileIo.File | null = null;
     try {
       const text: string = JSON.stringify(out);

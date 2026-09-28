@@ -331,8 +331,6 @@ export class PlanDetail {
   /** 合计学分（页面「小计/合计」行） */
   totalCredit: number = 0;
   totalHours: number = 0;
-  /** 培养方案 PDF 的相对地址（可能为空） */
-  pdfPath: string = '';
 
   /** 按体系分组并汇总学分 */
   buildGroups(): void {
@@ -362,4 +360,347 @@ export class PlanDetail {
     }
     this.groups = out;
   }
+}
+
+// ============================ 通选课修读情况 ============================
+
+/** 通选课类别要求 */
+export class ElectiveCategory {
+  /** 类别名，如「安全教育类」 */
+  name: string = '';
+  /** 要求学分（大于等于），可能为空 */
+  required: string = '';
+  /** 已修学分 */
+  earned: string = '';
+  /** 正在修读 */
+  ongoing: string = '';
+
+  /** 已修 + 在修是否已达到要求（要求为空时视为无硬性要求） */
+  satisfied(): boolean {
+    const req: number = parseFloat(this.required);
+    if (isNaN(req)) {
+      return false;
+    }
+    const e: number = parseFloat(this.earned);
+    const o: number = parseFloat(this.ongoing);
+    const got: number = (isNaN(e) ? 0 : e) + (isNaN(o) ? 0 : o);
+    return got >= req;
+  }
+}
+
+/**
+ * 一门通选课。两个来源共用这个类：
+ *   · 参考实现那边是主页自带的「课程明细」子表；
+ *   · **本校**的明细在另一个页面 —— 每个大类的「详情」指向
+ *     `/jsxsd/xxwcqk/xxwcqkOnkctxByxq.do?kctxmc=<大类名>`，可直接 GET，
+ *     返回 8 列表格：`课程编号 | 课程名称 | 学分 | 课程属性 | 课程性质 |
+ *     总成绩 | 备注 | 是否学位课`。
+ */
+export class ElectiveCourse {
+  courseCode: string = '';
+  courseName: string = '';
+  credit: string = '';
+  /** 总成绩；未出分时为「正在修读」 */
+  score: string = '';
+  category: string = '';
+  /** 课程属性（必修 / 选修 / 实践…）—— 本校详情页有这一列 */
+  attr: string = '';
+  /** 备注列（本校详情页有，多数为空） */
+  remark: string = '';
+
+  /** 是否正在修读（尚无成绩） */
+  isOngoing(): boolean {
+    return this.score.indexOf('正在修读') >= 0;
+  }
+
+  /** 已出成绩（界面据此把课程归到「已修」而不是「在读」） */
+  hasScore(): boolean {
+    return this.score.length > 0 && !this.isOngoing();
+  }
+
+  /**
+   * 学分数值。
+   *
+   * 详情页的学分列带说明（`3（计划内）`），直接 parseFloat 在说明写在
+   * 数字**前面**时会得 0；因此先滤掉非数字字符（与 Flutter 端同口径），
+   * 取不出数就当 0 —— 进度条据此算，宁可少算也不能得 NaN。
+   */
+  creditNumber(): number {
+    let cleaned: string = '';
+    for (let i = 0; i < this.credit.length; i++) {
+      const c: string = this.credit.charAt(i);
+      if ((c >= '0' && c <= '9') || c === '.') {
+        cleaned += c;
+      }
+    }
+    const v: number = parseFloat(cleaned);
+    return isNaN(v) ? 0 : v;
+  }
+}
+
+
+/**
+ * 一个大类 + 它下面的课程（界面按这个分组展示）。
+ *
+ * 学校原页面是两张独立的表：「类别修读情况」和「课程明细」，
+ * 学生要自己按类别名对照。分组把两者合成一条线。
+ */
+export class ElectiveGroup {
+  name: string = '';
+  courses: ElectiveCourse[] = [];
+  /** 汇总表里的要求信息；只在课程明细里出现、汇总表没有的大类为 null */
+  info: ElectiveCategory | null = null;
+  /**
+   * 用户自录的要求学分（≥0 时生效，-1 表示未设置）。
+   *
+   * 为什么要这个覆盖值：学校「要求学分（大于等于）」那一列实测是空的，
+   * 于是界面只能显示「学校未设置要求」、也画不出进度条 ——
+   * 学生明明可以从培养方案查到自己要修多少，App 却帮不上忙。
+   * 用户录一次后，达标判断与进度条都以这个值为准。
+   *
+   * 优先级：**用户自录 > 服务器**。用户手填的是他自己专业的准确要求，
+   * 而服务器那一列要么为空、要么是学校统一口径，以用户为准更符合预期。
+   */
+  customRequired: number = -1;
+
+  /**
+   * 是否已尝试加载过课程明细。
+   *
+   * 本校的明细在**另一个页面**（每行的「详情」），所以是**按需拉取**：
+   * 用户点开哪个大类才去抓哪个 —— 首屏不为 11 个大类打 11 个请求。
+   * 这个标记用来区分「还没取」（可点开）与「取过但没有课程」（不可点）。
+   */
+  coursesLoaded: boolean = false;
+
+  constructor(name: string) {
+    this.name = name;
+  }
+
+  hasCourses(): boolean {
+    return this.courses.length > 0;
+  }
+
+  /** 是否使用用户自录的要求（界面据此显示「修改」而不是「设置」） */
+  hasCustomRequired(): boolean {
+    return this.customRequired >= 0;
+  }
+
+  /** 能画进度条的前提：有正的分母（分母为 0 画出来没有意义） */
+  canShowProgress(): boolean {
+    const req: number = this.requiredNumber();
+    return req > 0;
+  }
+
+  requiredNumber(): number {
+    if (this.customRequired >= 0) {
+      return this.customRequired;
+    }
+    const c: ElectiveCategory | null = this.info;
+    if (c === null) {
+      return -1;
+    }
+    const v: number = parseFloat(c.required);
+    return isNaN(v) ? -1 : v;
+  }
+
+  earnedNumber(): number {
+    const c: ElectiveCategory | null = this.info;
+    if (c === null) {
+      return 0;
+    }
+    const v: number = parseFloat(c.earned);
+    return isNaN(v) ? 0 : v;
+  }
+
+  ongoingNumber(): number {
+    const c: ElectiveCategory | null = this.info;
+    if (c === null) {
+      return 0;
+    }
+    const v: number = parseFloat(c.ongoing);
+    return isNaN(v) ? 0 : v;
+  }
+}
+
+/** 通选课修读情况汇总 */
+export class ElectiveReport {
+  categories: ElectiveCategory[] = [];
+  courses: ElectiveCourse[] = [];
+  /** 总学分：已修 */
+  totalEarned: string = '';
+  /** 总学分：正在修读 */
+  totalOngoing: string = '';
+
+  /** 已修学分总和（数值） */
+  earnedNumber(): number {
+    const v: number = parseFloat(this.totalEarned);
+    return isNaN(v) ? 0 : v;
+  }
+
+  ongoingNumber(): number {
+    const v: number = parseFloat(this.totalOngoing);
+    return isNaN(v) ? 0 : v;
+  }
+
+  /**
+   * 按「大类 → 具体课程」归并。
+   *
+   * 两条刻意的规则：
+   *   1. 汇总表里的大类**全都保留**（即使本学期没有课）—— 修读要求挂在
+   *      大类上，藏起来学生就看不到还差多少学分；
+   *   2. 课程明细里出现、汇总表却没有的大类（学校数据不同步时会发生）
+   *      也追加进来，避免课程凭空消失。
+   *
+   * 两边都保持学校给出的原始顺序，不重排。
+   */
+  grouped(): ElectiveGroup[] {
+    const out: ElectiveGroup[] = [];
+    const byName: Map<string, ElectiveGroup> = new Map<string, ElectiveGroup>();
+    for (let i = 0; i < this.categories.length; i++) {
+      const c: ElectiveCategory = this.categories[i];
+      if (byName.has(c.name)) {
+        continue;   // 汇总表出现重名时只认第一条，不重复建组
+      }
+      const g: ElectiveGroup = new ElectiveGroup(c.name);
+      g.info = c;
+      byName.set(c.name, g);
+      out.push(g);
+    }
+    for (let i = 0; i < this.courses.length; i++) {
+      const c: ElectiveCourse = this.courses[i];
+      const key: string = c.category.length === 0 ? '未标注类别' : c.category;
+      let g: ElectiveGroup | undefined = byName.get(key);
+      if (g === undefined) {
+        g = new ElectiveGroup(key);
+        byName.set(key, g);
+        out.push(g);
+      }
+      g.courses.push(c);
+    }
+    return out;
+  }
+}
+
+// ============================ 培养方案 × 修读情况合并 ============================
+
+/**
+ * 「课程体系」列的配对/查询用键。
+ *
+ * ===== 为什么不能直接按原样比对 =====
+ * 两页的这一列都带装饰（实测语料）：
+ *   · 培养方案：单元格里是 `素质拓展必修课` + `<br>` + `(应修 10 / 已修 6.5)`，
+ *     解析出的 system 因此是两行；
+ *   · 修读情况：列名就写作「课程体系(属性)」，值形如 `素质拓展必修课(必修)`。
+ * 去掉这层确定格式的装饰后，两边就是同一组体系名。这不是模糊匹配：
+ * 归一后的名字仍按**精确相等**配对（见 mergePlanAndElective）——
+ * 匹配错了会把两个不同体系的数据并到一起，比不匹配更糟。
+ *
+ * 该页自己的「详情」链接用的也是裸名（`toShowxq('学科基础必修课')`），
+ * 因此抓课程明细时同样用它作 kctxmc 参数。
+ */
+export function systemMergeKey(name: string): string {
+  // 只取第一行：培养方案侧的注记从第二行开始
+  const lines: string[] = name.split('\n');
+  const first: string = (lines.length > 0 ? lines[0] : name).trim();
+  if (first.length === 0) {
+    return first;
+  }
+  // 剥掉尾部那一截括号注记（半角/全角都认）；整串都是括号内容时保留原样
+  const m: RegExpExecArray | null = /^(.*?)[（(][^（()）]*[)）]$/.exec(first);
+  if (m === null) {
+    return first;
+  }
+  const base: string = m[1].trim();
+  return base.length === 0 ? first : base;
+}
+
+/**
+ * 取培养方案「课程体系」格中名字之外的那截注记（无则空串）。
+ *
+ * 注记必须单独展示：名字归一后，`(应修 10 / 已修 6.5)` 这截带着
+ * 方案侧的应修/已修数字，在修读情况缺失时是用户唯一能看到的进度。
+ */
+export function planNoteOf(system: string): string {
+  const raw: string = system.trim();
+  const key: string = systemMergeKey(raw);
+  const at: number = raw.indexOf(key);
+  if (at < 0) {
+    return '';
+  }
+  // 注记里可能有多余换行/空格（服务端源码缩进），压成一行再显示
+  return raw.substring(at + key.length).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 培养方案分组 × 修读情况分组，按「课程体系」对齐后的一个区块。
+ *
+ * 两边不一定齐全（实测可能只在一侧出现），因此两个字段都可空：
+ *   · plan 为 null → 这个体系只在修读情况里出现；
+ *   · elective 为 null → 这个体系只在培养方案里出现。
+ * 两种都照常渲染（各自只有半边内容），不因为对不上就把谁丢掉。
+ */
+export class MergedPlanGroup {
+  /** 归一后的体系名：卡片标题，也是展开状态与明细加载的键（见 systemMergeKey） */
+  name: string = '';
+  /** 培养方案侧的分组（含该体系的课程与学分合计） */
+  plan: PlanGroup | null = null;
+  /** 修读情况侧的分组（含应修/已修/在修与按需加载的课程明细） */
+  elective: ElectiveGroup | null = null;
+  /** 培养方案「课程体系」格里附带的注记，如 `(应修 10 / 已修 6.5)`；空串表示没有 */
+  planNote: string = '';
+
+  constructor(name: string) {
+    this.name = name;
+  }
+}
+
+/**
+ * 把培养方案分组与修读情况分组按体系名对齐。
+ *
+ * ===== 三条刻意的规则 =====
+ *   1. 顺序以**培养方案**为准（本页是培养方案页）：方案里有几个体系就先排
+ *      几个，名字相同的修读分组挂进对应卡片；
+ *   2. 修读情况里多出来的体系（两边数据不同步时确实会发生）追加在后面，
+ *      不丢 —— 否则那些体系的已修/在修与修读记录会凭空消失；
+ *   3. 同一个归一名的分组只配**第一个**，其余不吞不并（宁可多出一张
+ *      半边内容的卡片，也不静默丢掉一条数据）。两边各自的重名都会走到这条。
+ */
+export function mergePlanAndElective(planGroups: PlanGroup[],
+  electiveGroups: ElectiveGroup[]): MergedPlanGroup[] {
+  const byKey: Map<string, ElectiveGroup> = new Map<string, ElectiveGroup>();
+  for (let i = 0; i < electiveGroups.length; i++) {
+    const g: ElectiveGroup = electiveGroups[i];
+    const k: string = systemMergeKey(g.name);
+    if (!byKey.has(k)) {
+      byKey.set(k, g);   // 重名（归一名相同）时只认第一条
+    }
+  }
+  const used: Set<ElectiveGroup> = new Set<ElectiveGroup>();
+  const out: MergedPlanGroup[] = [];
+  for (let i = 0; i < planGroups.length; i++) {
+    const p: PlanGroup = planGroups[i];
+    const key: string = systemMergeKey(p.system);
+    // 已被前面某个同名分组配走的修读分组不再重复挂载（规则 3）
+    const candidate: ElectiveGroup | undefined = byKey.get(key);
+    let e: ElectiveGroup | null = null;
+    if (candidate !== undefined && !used.has(candidate)) {
+      e = candidate;
+      used.add(e);
+    }
+    const mg: MergedPlanGroup = new MergedPlanGroup(key);
+    mg.plan = p;
+    mg.elective = e;
+    mg.planNote = planNoteOf(p.system);
+    out.push(mg);
+  }
+  for (let i = 0; i < electiveGroups.length; i++) {
+    const e: ElectiveGroup = electiveGroups[i];
+    if (used.has(e)) {
+      continue;
+    }
+    const mg: MergedPlanGroup = new MergedPlanGroup(systemMergeKey(e.name));
+    mg.elective = e;
+    out.push(mg);
+  }
+  return out;
 }

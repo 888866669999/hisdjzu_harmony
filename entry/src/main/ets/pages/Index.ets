@@ -116,16 +116,29 @@ struct Index {
   // 原先用 emoji：无法着色、跟不了主题与选中态，不同设备字形也不一致。
   //
   // 导航项与 Flutter 端 `kNavItems` 逐项对齐（课表/成绩/培养/我的）。
-  //
-  // 「空教室」刻意不在其中：它挂在课表页顶栏 —— 看课表时最常接着问的
-  // 就是「哪儿有空教室」，放在 dock 既多占一格，
-  // 又与「查自己的教务数据」这几个主入口不同类。
+  // 两项刻意不在其中：
+  //   · 「空教室」挂在课表页顶栏 —— 看课表时最常接着问的就是「哪儿有空教室」，
+  //     放在 dock 既多占一格，又与「查自己的教务数据」这几个主入口不同类；
+  //   · 「通选」（修读情况）**已并入培养方案页**（按课程体系对齐展示），
+  //     页面与 'elective' 路由都已删除 —— 不再有任何入口能进入一张只有半个
+  //     功能的旧页面（原先那句「改从培养页进入、页面与路由都保留」已不成立）。
   private navItems: NavItem[] = [
     new NavItem('schedule', '课表', 'calendar_month'),
     new NavItem('score', '成绩', 'bar_chart'),
     new NavItem('plan', '培养', 'menu_book'),
     new NavItem('profile', '我的', 'person')
   ];
+
+  /**
+   * 顶栏标题与 dock 标签不同的页面。
+   *
+   * dock 每格只有约 1/4 屏宽，四个标签都取两字才整齐（课表/成绩/培养/我的）；
+   * 顶栏没有这个限制，用全称更清楚。合并后的「培养」页同时承载培养方案与
+   * 各课程体系的修读情况，顶栏用全称「培养方案」尤其必要 —— 两字标签说不清。
+   * 与 Flutter 端 shell.dart 的 kFullPageTitles 同一处理。
+   */
+  private static readonly FULL_PAGE_TITLES: Map<string, string> =
+    new Map<string, string>([['plan', '培养方案']]);
 
   aboutToAppear(): void {
     // 键盘弹出时压缩可视区域（RESIZE），而不是整体上移（OFFSET），
@@ -311,6 +324,11 @@ struct Index {
   private titleOf(): string {
     if (this.active === 'settings') {
       return '设置';
+    }
+    // 顶栏全称优先（目前只有「培养」页：合并后内容已不止培养方案，见上）
+    const full: string | undefined = Index.FULL_PAGE_TITLES.get(this.active);
+    if (full !== undefined) {
+      return full;
     }
     for (let i = 0; i < this.navItems.length; i++) {
       if (this.navItems[i].key === this.active) {
@@ -669,7 +687,7 @@ struct Index {
    * 成绩页要的是「列表之外（尤其是底部）透出下层」—— 窗口背景已在
    * EntryAbility 里设为透明，所以不铺底色就能透出桌面/壁纸。
    *
-   * 其余页面必须铺：它们的内容常常不满一屏（培养方案、通识、设置等），
+   * 其余页面必须铺：它们的内容常常不满一屏（培养方案、设置等），
    * 不铺的话会直接露出桌面，看起来像渲染坏了。
    * 课表页虽然也不铺自己的底色，但网格自带 sched_bg，所以这里照铺无妨。
    */

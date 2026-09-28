@@ -21,6 +21,12 @@
  *
  * 数据行**从右往左读**：左侧的「选课组/课号」列数因 rowspan 不固定，
  * 从右边数位置才是稳定的。
+ *
+ * ===== 附件（PDF）解析已删除 =====
+ * 早先这里还从页面里正则提取培养方案 PDF 附件地址（`uploadfile/*.pdf`），
+ * 供下载入口使用。实测本校的培养方案页面里没有任何附件（`uploadfile`、
+ * `.pdf`、`附件` 均不出现），整套链路（含 data/PdfStore、PlanPage 的 PDF
+ * 卡片）已随合并改版整块删除。页面里若出现附件链接，本解析器照旧只读课程表。
  */
 import { HtmlLite, HtmlTable, HtmlRow, HtmlCell } from './HtmlLite';
 import { PlanDetail, PlanCourse } from '../model/Models';
@@ -43,11 +49,10 @@ export class PlanParser {
     } else {
       PlanParser.parseCourses(mx, plan);
     }
-    plan.pdfPath = PlanParser.parsePdfPath(html);
     plan.buildGroups();
 
     Logger.info('plan parsed: courses=' + plan.courses.length + ' groups=' + plan.groups.length +
-      ' paragraphs=' + plan.introParagraphs.length + ' pdf=' + (plan.pdfPath.length > 0 ? 'yes' : 'no'));
+      ' paragraphs=' + plan.introParagraphs.length);
     return plan;
   }
 
@@ -350,20 +355,5 @@ export class PlanParser {
   private static off(cols: Map<string, number>, name: string, fallback: number): number {
     const v: number | undefined = cols.get(name);
     return v === undefined ? fallback : v;
-  }
-
-  /**
-   * 取 PDF 相对地址。页面里的形态是 iframe 的 src，例如：
-   *   <iframe src="/ewebeditor/uploadfile/2025033110250359448.pdf">
-   * 这里直接匹配路径本身，避免依赖引号与属性的排列顺序。
-   */
-  private static parsePdfPath(html: string): string {
-    const m: string[] | null = html.match(/\/[A-Za-z0-9_\/.-]*uploadfile\/[A-Za-z0-9_.%-]+\.pdf/i);
-    if (m !== null && m.length > 0 && m[0].length > 0) {
-      return m[0];
-    }
-    // 兜底：任意位置的 .pdf 路径
-    const m2: string[] | null = html.match(/[A-Za-z0-9_\/.-]+\.pdf/i);
-    return (m2 !== null && m2.length > 0) ? m2[0] : '';
   }
 }
